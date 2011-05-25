@@ -10,16 +10,31 @@ def _not_exists(fieldname):
     raise FieldDoesNotExist('"%s" is not a ManyToManyField or a reverse ForeignKey relationship' % fieldname)
 
 def _check_field_exists(model, fieldname):
-    field_object, model, direct, m2m = model._meta.get_field_by_name(fieldname)
+    try:
+        field_object, model, direct, m2m = model._meta.get_field_by_name(fieldname)
+    except FieldDoesNotExist:
+        # might be after reverse foreign key
+        # which by default don't have the name we expect
+        if fieldname.endswith('_set'):
+            return _check_field_exists(model, fieldname[:-len('_set')])
+        else:
+            raise
     if not m2m:
         if direct: # reverse foreign key relationship
             _not_exists(fieldname)
+    return fieldname
+
+def _id_attr(id_column):
+    # mangle the id column name, so we can make sure
+    # the postgres doesn't complain about not quoting
+    # field names (this helps make sure we don't clash
+    # with the regular id column)
+    return '__%s' % id_column.lower()
 
 def _select_related_instances(related_model, related_name, ids, db_table, id_column):
-    id__in_filter={ ('%s__in' % related_name): ids }
-
+    id__in_filter={ ('%s__pk__in' % related_name): ids }
     qn = connection.ops.quote_name
-    select = { id_column: '%s.%s' % (qn(db_table), qn(id_column)) }
+    select = { _id_attr(id_column): '%s.%s' % (qn(db_table), qn(id_column)) }
     related_instances = related_model._default_manager \
                             .filter(**id__in_filter) \
                             .extra(select=select)
@@ -33,30 +48,37 @@ def batch_select(model, instances, target_field_name, fieldname, filter=None):
     
     returns a list of the instances with the newly attached fields
     
-    batch_select(Entry, Entry.objects.all(), 'tags', 'all_tags')
+    batch_select(Entry, Entry.objects.all(), 'tags_all', 'tags')
     
-    would return a list of Entry objects with 'all_tags' fields
+    would return a list of Entry objects with 'tags_all' fields
     containing the tags for that Entry
     
     filter is a function that can be used alter the extra-query - it 
     takes a queryset and returns a filtered version of the queryset
     
     NB: this is a semi-private API at the moment, but may be useful if you
-    dont want to change you model/manager.
+    dont want to change your model/manager.
     '''
     
-    _check_field_exists(model, fieldname)
+    fieldname = _check_field_exists(model, fieldname)
     
     instances = list(instances)
-    ids = [instance.id for instance in instances]
+    ids = [instance.pk for instance in instances]
     
     field_object, model, direct, m2m = model._meta.get_field_by_name(fieldname)
     if m2m:
-        m2m_field = field_object
-        related_model = m2m_field.rel.to # model on other end of relationship
-        related_name = m2m_field.related_query_name()
-        id_column = m2m_field.m2m_column_name()
-        db_table  = m2m_field.m2m_db_table()
+        if not direct:
+            m2m_field = field_object.field
+            related_model = field_object.model
+            related_name = m2m_field.name
+            id_column = m2m_field.m2m_reverse_name()
+            db_table = m2m_field.m2m_db_table()
+        else:
+            m2m_field = field_object
+            related_model = m2m_field.rel.to # model on other end of relationship
+            related_name = m2m_field.related_query_name()
+            id_column = m2m_field.m2m_column_name()
+            db_table  = m2m_field.m2m_db_table()
     elif not direct:
         # handle reverse foreign key relationships
         fk_field = field_object.field
@@ -72,14 +94,15 @@ def batch_select(model, instances, target_field_name, fieldname, filter=None):
         related_instances = filter(related_instances)
     
     grouped = {}
+    id_attr = _id_attr(id_column)
     for related_instance in related_instances:
-        instance_id = getattr(related_instance, id_column)
+        instance_id = getattr(related_instance, id_attr)
         group = grouped.get(instance_id, [])
         group.append(related_instance)
         grouped[instance_id] = group
     
     for instance in instances:
-        setattr(instance, target_field_name, grouped.get(instance.id,[]))
+        setattr(instance, target_field_name, grouped.get(instance.pk, []))
     
     return instances
 
@@ -155,6 +178,8 @@ class BatchManager(models.Manager):
 if getattr(settings, 'TESTING_BATCH_SELECT', False):
     class Tag(models.Model):
         name = models.CharField(max_length=32)
+        
+        objects = BatchManager()
     
     class Section(models.Model):
         name = models.CharField(max_length=32)
@@ -169,6 +194,13 @@ if getattr(settings, 'TESTING_BATCH_SELECT', False):
         section  = models.ForeignKey(Section, blank=True, null=True)
         location = models.ForeignKey(Location, blank=True, null=True)
         tags = models.ManyToManyField(Tag)
+        
+        objects = BatchManager()
+    
+    class Country(models.Model):
+        # non id pk
+        name = models.CharField(primary_key=True, max_length=100)
+        locations = models.ManyToManyField(Location)
         
         objects = BatchManager()
         

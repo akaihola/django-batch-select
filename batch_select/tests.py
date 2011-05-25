@@ -3,7 +3,9 @@ from django.conf import settings
 if getattr(settings, 'TESTING_BATCH_SELECT', False):
     from django.test import TransactionTestCase
     from django.db.models.fields import FieldDoesNotExist
-    from batch_select.models import Tag, Entry, Section, Batch, Location, _select_related_instances
+    from batch_select.models import Tag, Entry, Section, Batch, Location,\
+                                    _select_related_instances, Country,\
+                                    _check_field_exists
     from batch_select.replay import Replay
     from django import db
     from django.db.models import Count
@@ -233,6 +235,38 @@ if getattr(settings, 'TESTING_BATCH_SELECT', False):
             self.failUnlessEqual(set([]),               set(section2.entry_all))
             self.failUnlessEqual(set([entry3]),         set(section3.entry_all))
         
+        def test___check_field_exists_full_field_name(self):
+            # make sure we can retrieve the "real" fieldname
+            # given the full fieldname for a reverse foreign key
+            # relationship
+            # e.g. give "entry_set" we should get "entry"
+            self.failUnlessEqual("entry", _check_field_exists(Section, "entry_set"))
+        
+        def test___check_field_exists_full_field_name_non_existant_field(self):
+            try:
+                _check_field_exists(Section, "qwerty_set")
+                self.fail('selected field that does not exist')
+            except FieldDoesNotExist:
+                pass
+        
+        def test_batch_select_one_to_many_with_children_full_field_name(self):
+            section1 = Section.objects.create(name='s1')
+            section2 = Section.objects.create(name='s2')
+            section3 = Section.objects.create(name='s3')
+
+            entry1 = Entry.objects.create(section=section1)
+            entry2 = Entry.objects.create(section=section1)
+            entry3 = Entry.objects.create(section=section3)
+
+            sections = Section.objects.batch_select('entry_set').order_by('id')
+            self.failUnlessEqual([section1, section2, section3], list(sections))
+
+            section1, section2, section3 = list(sections)
+
+            self.failUnlessEqual(set([entry1, entry2]), set(section1.entry_set_all))
+            self.failUnlessEqual(set([]),               set(section2.entry_set_all))
+            self.failUnlessEqual(set([entry3]),         set(section3.entry_set_all))
+        
         @with_debug_queries
         def test_batch_select_one_to_many_with_children_minimal_queries(self):
             section1 = Section.objects.create(name='s1')
@@ -458,6 +492,46 @@ if getattr(settings, 'TESTING_BATCH_SELECT', False):
             batch = Batch('tags').order_by('id').only('id')
             self._check_name_deferred(batch)
         
+        def test_batch_select_reverse_m2m(self):
+            entry1, entry2, entry3, entry4 = _create_entries(4)
+            tag1, tag2, tag3 = _create_tags('tag1', 'tag2', 'tag3')
+
+            entry1.tags.add(tag1, tag2, tag3)
+
+            entry2.tags.add(tag2)
+
+            entry3.tags.add(tag2, tag3)
+
+            tags = Tag.objects.batch_select('entry')\
+                              .filter(id__in=[tag1.id, tag2.id, tag3.id])\
+                              .order_by('id')
+            tags = list(tags)
+
+            self.failUnlessEqual([tag1, tag2, tag3], tags)
+
+            tag1, tag2, tag3 = tags
+
+            self.failUnlessEqual(set([entry1]), set(tag1.entry_all))
+            self.failUnlessEqual(set([entry1, entry2, entry3]),
+                                 set(tag2.entry_all))
+            self.failUnlessEqual(set([entry1, entry3]), set(tag3.entry_all))
+
+        def test_non_id_primary_key(self):
+            uk = Country.objects.create(name='United Kingdom')
+            brighton = Location.objects.create(name='Brighton')
+            hove = Location.objects.create(name='Hove')
+
+            uk.locations.add(brighton, hove)
+
+            countries = Country.objects.batch_select('locations')
+            countries = list(countries)
+
+            self.failUnlessEqual([uk], countries)
+
+            uk = countries[0]
+            self.failUnlessEqual(set([brighton, hove]), set(uk.locations_all))
+
+
     class ReplayTestCase(unittest.TestCase):
         
         def setUp(self):
@@ -514,6 +588,7 @@ if getattr(settings, 'TESTING_BATCH_SELECT', False):
     class QuotingTestCase(TransactionTestCase):
         """Ensure correct quoting of table and field names in queries"""
 
+        @with_debug_queries
         def test_uses_backend_specific_quoting(self):
             """Backend-specific quotes should be used
 
@@ -524,14 +599,16 @@ if getattr(settings, 'TESTING_BATCH_SELECT', False):
             would be difficult.
             """
             qn = db.connection.ops.quote_name
-            qs = _select_related_instances(Entry, 'id', [1],
+            qs = _select_related_instances(Entry, 'section', [1],
                                            'batch_select_entry', 'section_id')
-            sql = qs.query.as_sql()[0]
+            db.reset_queries()
+            list(qs)
+            sql = db.connection.queries[-1]['sql']
             self.failUnless(sql.startswith('SELECT (%s.%s) AS ' %(
                         qn('batch_select_entry'), qn('section_id'))))
 
         @with_debug_queries
-        def test_batch_select_related(self):
+        def test_batch_select_related_quoted_section_id(self):
             """Field names should be quoted in the WHERE clause
 
             PostgreSQL is particularly picky about quoting when table
@@ -544,7 +621,7 @@ if getattr(settings, 'TESTING_BATCH_SELECT', False):
             sections = Section.objects.batch_select('entry').all()
             sections[0]
             sql = db.connection.queries[-1]['sql']
-            correct_where = ' WHERE "batch_select_entry"."section_ID" IN (1)'
+            correct_where = ' WHERE "batch_select_entry"."section_id" IN (1)'
             self.failUnless(sql.endswith(correct_where),
-                            '"section_ID" is not correctly quoted in the WHERE '
+                            '"section_id" is not correctly quoted in the WHERE '
                             'clause of %r' % sql)
